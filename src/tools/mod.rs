@@ -4,7 +4,56 @@ use rmcp::model::*;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::ServerHandler;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{error, info, warn};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const DEFAULT_LIMIT: i64 = 20;
+const MAX_LIMIT: i64 = 500;
+const DEFAULT_OFFSET: i64 = 0;
+const DEFAULT_DAYS: i64 = 30;
+const MAX_DAYS: i64 = 365;
+
+const VALID_PERIODS: &[&str] = &["today", "week", "month", "all"];
+const VALID_METRICS: &[&str] = &["contacts", "deals", "activities", "emails"];
+const VALID_GRANULARITIES: &[&str] = &["daily", "weekly", "monthly"];
+
+// ============================================================================
+// Input helpers
+// ============================================================================
+
+/// Extract a trimmed string from args. Returns None if key missing or empty after trim.
+fn get_trimmed_str(args: &serde_json::Value, key: &str) -> Option<String> {
+    get_str(args, key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Extract and clamp a limit value.
+fn get_limit(args: &serde_json::Value) -> i64 {
+    get_i64(args, "limit")
+        .unwrap_or(DEFAULT_LIMIT)
+        .max(1)
+        .min(MAX_LIMIT)
+}
+
+/// Extract and clamp an offset value.
+fn get_offset(args: &serde_json::Value) -> i64 {
+    get_i64(args, "offset").unwrap_or(DEFAULT_OFFSET).max(0)
+}
+
+/// Validate a period value, returning a default if invalid.
+fn validate_period(args: &serde_json::Value, default: &str) -> Result<String, CallToolResult> {
+    let period = get_trimmed_str(args, "period").unwrap_or_else(|| default.to_string());
+    if !VALID_PERIODS.contains(&period.as_str()) {
+        return Err(error_result(&format!(
+            "Invalid period '{}'. Must be one of: {}",
+            period,
+            VALID_PERIODS.join(", ")
+        )));
+    }
+    Ok(period)
+}
 
 // ============================================================================
 // Data types
@@ -118,7 +167,8 @@ fn build_tools() -> Vec<Tool> {
             ),
             input_schema: make_schema(
                 serde_json::json!({
-                    "limit": { "type": "integer", "description": "Max results (default 20)" }
+                    "limit": { "type": "integer", "description": "Max results (default 20, max 500)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip (default 0)" }
                 }),
                 vec![],
             ),
@@ -137,7 +187,9 @@ fn build_tools() -> Vec<Tool> {
             ),
             input_schema: make_schema(
                 serde_json::json!({
-                    "period": { "type": "string", "enum": ["today", "week", "month", "all"], "description": "Time period (default: month)" }
+                    "period": { "type": "string", "enum": ["today", "week", "month", "all"], "description": "Time period (default: month)" },
+                    "limit": { "type": "integer", "description": "Max results per metric (default 20, max 500)" },
+                    "offset": { "type": "integer", "description": "Number of results to skip per metric (default 0)" }
                 }),
                 vec![],
             ),
@@ -158,7 +210,9 @@ fn build_tools() -> Vec<Tool> {
                 serde_json::json!({
                     "metric": { "type": "string", "enum": ["contacts", "deals", "activities", "emails"], "description": "Which metric to trend" },
                     "granularity": { "type": "string", "enum": ["daily", "weekly", "monthly"], "description": "Time granularity (default: daily)" },
-                    "days": { "type": "integer", "description": "How many days back to look (default: 30)" }
+                    "days": { "type": "integer", "description": "How many days back to look (default: 30, max: 365)" },
+                    "limit": { "type": "integer", "description": "Max data points to return (default 20, max 500)" },
+                    "offset": { "type": "integer", "description": "Number of data points to skip (default 0)" }
                 }),
                 vec!["metric"],
             ),
@@ -287,7 +341,10 @@ impl DashboardMcpServer {
     // ---- Tool handlers ----
 
     async fn handle_kpi_snapshot(&self, args: &serde_json::Value) -> CallToolResult {
-        let period = get_str(args, "period").unwrap_or_else(|| "all".into());
+        let period = match validate_period(args, "all") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         let time_filter = Self::period_filter(&period);
 
         let mut kpis = serde_json::Map::new();
@@ -300,7 +357,10 @@ impl DashboardMcpServer {
             .await
         {
             Ok(row) => { kpis.insert("contacts_added".into(), serde_json::json!(row.count)); }
-            Err(_) => { kpis.insert("contacts_added".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.contacts for KPI snapshot");
+                kpis.insert("contacts_added".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Deals won
@@ -312,7 +372,10 @@ impl DashboardMcpServer {
             .await
         {
             Ok(row) => { kpis.insert("deals_won".into(), serde_json::json!(row.count)); }
-            Err(_) => { kpis.insert("deals_won".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.deals (won) for KPI snapshot");
+                kpis.insert("deals_won".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Total deals
@@ -322,7 +385,10 @@ impl DashboardMcpServer {
             .await
         {
             Ok(row) => { kpis.insert("total_deals".into(), serde_json::json!(row.count)); }
-            Err(_) => { kpis.insert("total_deals".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.deals (total) for KPI snapshot");
+                kpis.insert("total_deals".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Pipeline value
@@ -333,7 +399,10 @@ impl DashboardMcpServer {
         .await
         {
             Ok(row) => { kpis.insert("pipeline_value".into(), serde_json::json!(row.total.unwrap_or(0.0))); }
-            Err(_) => { kpis.insert("pipeline_value".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query pipeline value");
+                kpis.insert("pipeline_value".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Emails sent (from email schema if exists)
@@ -344,7 +413,10 @@ impl DashboardMcpServer {
             .await
         {
             Ok(row) => { kpis.insert("emails_sent".into(), serde_json::json!(row.count)); }
-            Err(_) => { kpis.insert("emails_sent".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query email.sent_emails");
+                kpis.insert("emails_sent".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Enrichments run (from enrichment schema if exists)
@@ -354,20 +426,26 @@ impl DashboardMcpServer {
             .await
         {
             Ok(row) => { kpis.insert("enrichments_run".into(), serde_json::json!(row.count)); }
-            Err(_) => { kpis.insert("enrichments_run".into(), serde_json::json!("schema_unavailable")); }
+            Err(e) => {
+                warn!(error = %e, "Failed to query enrichment.enrichment_runs");
+                kpis.insert("enrichments_run".into(), serde_json::json!("schema_unavailable"));
+            }
         }
 
         // Cache the results
         for (key, val) in &kpis {
             if let Some(n) = val.as_i64() {
-                let _ = sqlx::query(
+                if let Err(e) = sqlx::query(
                     "INSERT INTO dashboard.kpi_cache (metric_name, value, period) VALUES ($1, $2, $3)",
                 )
                 .bind(key)
                 .bind(n as f64)
                 .bind(&period)
                 .execute(self.db.pool())
-                .await;
+                .await
+                {
+                    warn!(error = %e, metric = key, "Failed to cache KPI metric");
+                }
             }
         }
 
@@ -417,7 +495,10 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(e) => return error_result(&format!("Failed to query pipeline: {e}")),
+            Err(e) => {
+                error!(error = %e, "Failed to query deal pipeline for revenue forecast");
+                return error_result(&format!("Failed to query pipeline: {e}"));
+            }
         }
 
         // Closed won revenue
@@ -428,7 +509,10 @@ impl DashboardMcpServer {
         .await
         {
             Ok(row) => row.total.unwrap_or(0.0),
-            Err(_) => 0.0,
+            Err(e) => {
+                warn!(error = %e, "Failed to query closed_won revenue, defaulting to 0");
+                0.0
+            }
         };
 
         forecast.insert("stages".into(), serde_json::json!(stages));
@@ -445,16 +529,18 @@ impl DashboardMcpServer {
     }
 
     async fn handle_activity_feed(&self, args: &serde_json::Value) -> CallToolResult {
-        let limit = get_i64(args, "limit").unwrap_or(20);
+        let limit = get_limit(args);
+        let offset = get_offset(args);
         let mut activities: Vec<serde_json::Value> = Vec::new();
 
         // CRM activities
         match sqlx::query_as::<_, ActivityRow>(
             r#"SELECT 'crm' as source, activity_type, subject, occurred_at
                FROM crm.activities
-               ORDER BY occurred_at DESC LIMIT $1"#,
+               ORDER BY occurred_at DESC LIMIT $1 OFFSET $2"#,
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
@@ -468,7 +554,9 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.activities for activity feed");
+            }
         }
 
         // Recent contacts
@@ -478,9 +566,10 @@ impl DashboardMcpServer {
             created_at: chrono::DateTime<chrono::Utc>,
         }
         match sqlx::query_as::<_, RecentContact>(
-            "SELECT email, created_at FROM crm.contacts ORDER BY created_at DESC LIMIT $1",
+            "SELECT email, created_at FROM crm.contacts ORDER BY created_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
@@ -494,7 +583,9 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.contacts for activity feed");
+            }
         }
 
         // Recent deals
@@ -505,9 +596,10 @@ impl DashboardMcpServer {
             updated_at: chrono::DateTime<chrono::Utc>,
         }
         match sqlx::query_as::<_, RecentDeal>(
-            "SELECT title, stage, updated_at FROM crm.deals ORDER BY updated_at DESC LIMIT $1",
+            "SELECT title, stage, updated_at FROM crm.deals ORDER BY updated_at DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
+        .bind(offset)
         .fetch_all(self.db.pool())
         .await
         {
@@ -521,7 +613,9 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query crm.deals for activity feed");
+            }
         }
 
         // Sort all by timestamp descending
@@ -534,12 +628,22 @@ impl DashboardMcpServer {
         // Truncate to limit
         activities.truncate(limit as usize);
 
-        info!(count = activities.len(), "Activity feed generated");
-        json_result(&activities)
+        info!(count = activities.len(), limit = limit, offset = offset, "Activity feed generated");
+        json_result(&serde_json::json!({
+            "activities": activities,
+            "limit": limit,
+            "offset": offset,
+            "count": activities.len(),
+        }))
     }
 
     async fn handle_team_performance(&self, args: &serde_json::Value) -> CallToolResult {
-        let period = get_str(args, "period").unwrap_or_else(|| "month".into());
+        let period = match validate_period(args, "month") {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let limit = get_limit(args);
+        let offset = get_offset(args);
         let time_filter = Self::period_filter(&period);
 
         let mut team: Vec<serde_json::Value> = Vec::new();
@@ -549,9 +653,13 @@ impl DashboardMcpServer {
             r#"SELECT owner_id, 'deals_closed' as metric, COUNT(*) as count
                FROM crm.deals
                WHERE stage = 'closed_won' AND owner_id IS NOT NULL {time_filter}
-               GROUP BY owner_id"#
+               GROUP BY owner_id
+               ORDER BY count DESC
+               LIMIT $1 OFFSET $2"#
         );
         match sqlx::query_as::<_, TeamRow>(&sql)
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         {
@@ -564,7 +672,9 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query deals closed per owner");
+            }
         }
 
         // Contacts owned per owner
@@ -572,9 +682,13 @@ impl DashboardMcpServer {
             r#"SELECT owner_id, 'contacts_owned' as metric, COUNT(*) as count
                FROM crm.contacts
                WHERE owner_id IS NOT NULL {time_filter}
-               GROUP BY owner_id"#
+               GROUP BY owner_id
+               ORDER BY count DESC
+               LIMIT $1 OFFSET $2"#
         );
         match sqlx::query_as::<_, TeamRow>(&sql)
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         {
@@ -587,7 +701,9 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query contacts owned per owner");
+            }
         }
 
         // Activities per owner (via deals)
@@ -596,10 +712,14 @@ impl DashboardMcpServer {
                FROM crm.activities a
                JOIN crm.deals d ON d.id = a.deal_id
                WHERE d.owner_id IS NOT NULL {time_filter_a}
-               GROUP BY d.owner_id"#,
+               GROUP BY d.owner_id
+               ORDER BY count DESC
+               LIMIT $1 OFFSET $2"#,
             time_filter_a = Self::period_filter_col(&period, "a.occurred_at")
         );
         match sqlx::query_as::<_, TeamRow>(&sql)
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         {
@@ -612,20 +732,46 @@ impl DashboardMcpServer {
                     }));
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                warn!(error = %e, "Failed to query activities per owner");
+            }
         }
 
-        info!(period = period.as_str(), "Team performance generated");
-        json_result(&serde_json::json!({ "period": period, "metrics": team }))
+        info!(period = period.as_str(), limit = limit, offset = offset, "Team performance generated");
+        json_result(&serde_json::json!({
+            "period": period,
+            "metrics": team,
+            "limit": limit,
+            "offset": offset,
+        }))
     }
 
     async fn handle_trend_chart(&self, args: &serde_json::Value) -> CallToolResult {
-        let metric = match get_str(args, "metric") {
+        let metric = match get_trimmed_str(args, "metric") {
             Some(m) => m,
             None => return error_result("Missing required parameter: metric"),
         };
-        let granularity = get_str(args, "granularity").unwrap_or_else(|| "daily".into());
-        let days = get_i64(args, "days").unwrap_or(30);
+
+        if !VALID_METRICS.contains(&metric.as_str()) {
+            return error_result(&format!(
+                "Invalid metric '{}'. Must be one of: {}",
+                metric,
+                VALID_METRICS.join(", ")
+            ));
+        }
+
+        let granularity = get_trimmed_str(args, "granularity").unwrap_or_else(|| "daily".into());
+        if !VALID_GRANULARITIES.contains(&granularity.as_str()) {
+            return error_result(&format!(
+                "Invalid granularity '{}'. Must be one of: {}",
+                granularity,
+                VALID_GRANULARITIES.join(", ")
+            ));
+        }
+
+        let days = get_i64(args, "days").unwrap_or(DEFAULT_DAYS).max(1).min(MAX_DAYS);
+        let limit = get_limit(args);
+        let offset = get_offset(args);
 
         let trunc = match granularity.as_str() {
             "weekly" => "week",
@@ -638,17 +784,21 @@ impl DashboardMcpServer {
             "deals" => ("crm.deals", "created_at"),
             "activities" => ("crm.activities", "occurred_at"),
             "emails" => ("email.sent_emails", "sent_at"),
-            _ => return error_result(&format!("Unknown metric: {metric}. Use: contacts, deals, activities, emails")),
+            // Already validated above, this branch is unreachable
+            _ => return error_result(&format!("Unknown metric: {metric}")),
         };
 
         let sql = format!(
             r#"SELECT DATE_TRUNC('{trunc}', {col})::TEXT as period, COUNT(*) as count
                FROM {table}
                WHERE {col} >= CURRENT_DATE - INTERVAL '{days} days'
-               GROUP BY 1 ORDER BY 1"#
+               GROUP BY 1 ORDER BY 1
+               LIMIT $1 OFFSET $2"#
         );
 
         match sqlx::query_as::<_, TrendRow>(&sql)
+            .bind(limit)
+            .bind(offset)
             .fetch_all(self.db.pool())
             .await
         {
@@ -668,19 +818,31 @@ impl DashboardMcpServer {
                     "granularity": granularity,
                     "days": days,
                     "data": data,
+                    "limit": limit,
+                    "offset": offset,
+                    "count": data.len(),
                 }))
             }
-            Err(e) => error_result(&format!("Trend query failed (schema may not exist): {e}")),
+            Err(e) => {
+                error!(error = %e, metric = metric.as_str(), "Trend query failed");
+                error_result(&format!("Trend query failed (schema may not exist): {e}"))
+            }
         }
     }
 
     async fn handle_save_dashboard(&self, args: &serde_json::Value) -> CallToolResult {
-        let name = match get_str(args, "name") {
+        let name = match get_trimmed_str(args, "name") {
             Some(n) => n,
-            None => return error_result("Missing required parameter: name"),
+            None => return error_result("Missing required parameter: name (must be a non-empty string)"),
         };
+
+        if name.len() > 255 {
+            return error_result("Dashboard name must be 255 characters or fewer");
+        }
+
         let config = match args.get("config") {
-            Some(c) => c.clone(),
+            Some(c) if c.is_object() => c.clone(),
+            Some(_) => return error_result("Parameter 'config' must be a JSON object"),
             None => return error_result("Missing required parameter: config"),
         };
 
@@ -699,14 +861,17 @@ impl DashboardMcpServer {
                 info!(name = name.as_str(), "Dashboard saved");
                 json_result(&dash)
             }
-            Err(e) => error_result(&format!("Failed to save dashboard: {e}")),
+            Err(e) => {
+                error!(error = %e, name = name.as_str(), "Failed to save dashboard");
+                error_result(&format!("Failed to save dashboard: {e}"))
+            }
         }
     }
 
     async fn handle_load_dashboard(&self, args: &serde_json::Value) -> CallToolResult {
-        let name = match get_str(args, "name") {
+        let name = match get_trimmed_str(args, "name") {
             Some(n) => n,
-            None => return error_result("Missing required parameter: name"),
+            None => return error_result("Missing required parameter: name (must be a non-empty string)"),
         };
 
         match sqlx::query_as::<_, SavedDashboard>(
@@ -716,15 +881,25 @@ impl DashboardMcpServer {
         .fetch_optional(self.db.pool())
         .await
         {
-            Ok(Some(dash)) => json_result(&dash),
+            Ok(Some(dash)) => {
+                info!(name = name.as_str(), "Dashboard loaded");
+                json_result(&dash)
+            }
             Ok(None) => {
                 // List available dashboards
-                let names: Vec<String> = sqlx::query_scalar(
+                let names: Vec<String> = match sqlx::query_scalar(
                     "SELECT name FROM dashboard.saved_dashboards ORDER BY name",
                 )
                 .fetch_all(self.db.pool())
                 .await
-                .unwrap_or_default();
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to list available dashboards");
+                        vec![]
+                    }
+                };
+                warn!(name = name.as_str(), "Dashboard not found");
                 error_result(&format!(
                     "Dashboard '{}' not found. Available: {}",
                     name,
@@ -735,7 +910,10 @@ impl DashboardMcpServer {
                     }
                 ))
             }
-            Err(e) => error_result(&format!("Failed to load dashboard: {e}")),
+            Err(e) => {
+                error!(error = %e, name = name.as_str(), "Failed to load dashboard");
+                error_result(&format!("Failed to load dashboard: {e}"))
+            }
         }
     }
 
@@ -761,6 +939,7 @@ impl DashboardMcpServer {
                     unhealthy += 1;
                 }
                 Err(e) => {
+                    error!(error = %e, schema = schema, "Health check failed for schema");
                     results.insert(
                         schema.to_string(),
                         serde_json::json!(format!("error: {e}")),
@@ -776,6 +955,7 @@ impl DashboardMcpServer {
                 results.insert("database".into(), serde_json::json!("connected"));
             }
             Err(e) => {
+                error!(error = %e, "Database health check failed");
                 results.insert("database".into(), serde_json::json!(format!("error: {e}")));
             }
         }
@@ -831,6 +1011,8 @@ impl ServerHandler for DashboardMcpServer {
                 serde_json::to_value(&request.arguments).unwrap_or(serde_json::Value::Null);
             let name_str: &str = request.name.as_ref();
 
+            info!(tool = name_str, "Tool invoked");
+
             let result = match name_str {
                 "kpi_snapshot" => self.handle_kpi_snapshot(&args).await,
                 "revenue_forecast" => self.handle_revenue_forecast().await,
@@ -840,7 +1022,10 @@ impl ServerHandler for DashboardMcpServer {
                 "save_dashboard" => self.handle_save_dashboard(&args).await,
                 "load_dashboard" => self.handle_load_dashboard(&args).await,
                 "health_check" => self.handle_health_check().await,
-                _ => error_result(&format!("Unknown tool: {}", request.name)),
+                other => {
+                    warn!(tool = other, "Unknown tool invoked");
+                    error_result(&format!("Unknown tool: {}", request.name))
+                }
             };
 
             Ok(result)
