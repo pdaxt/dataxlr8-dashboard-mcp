@@ -5,6 +5,10 @@ edition = "2024"
 description = "Executive dashboard MCP server for DataXLR8 platform"
 repository = "https://github.com/pdaxt/dataxlr8-dashboard-mcp"
 
+
+[lib]
+name = "dataxlr8_dashboard_mcp"
+path = "src/lib.rs"
 [dependencies]
 # MCP SDK
 rmcp = { version = "0.17", features = ["server", "transport-io"] }
